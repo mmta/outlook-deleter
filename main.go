@@ -28,8 +28,8 @@ const (
 	MaxRetries               = 3
 	RetryDelay               = 1 * time.Second
 	TokenBufferDuration      = 5 * time.Minute
-	ProactiveRefreshInterval = 10 * time.Minute
-	ProactiveRefreshBuffer   = 15 * time.Minute
+	ProactiveRefreshInterval = 5 * time.Minute
+	ProactiveRefreshBuffer   = 30 * time.Minute
 	BatchDelayDuration       = 2 * time.Second
 	RetryWaitDuration        = 5 * time.Second
 	MaxFolderDepth           = 50
@@ -545,12 +545,22 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 		if err != nil {
 			return deleteResult{messageID: messageID, err: err}
 		}
+
+		// Read response body for error details
+		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		// Handle token expiration (only retry once per request)
-		if resp.StatusCode == http.StatusUnauthorized {
-			if retryCount < MaxRetries {
-				fmt.Printf("    [Msg %s] Token expired, refreshing...\n", messageID)
+		// Handle token expiration - check response body to distinguish from permission errors
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			// Check if it's actually a token/auth error vs permission error
+			bodyStr := string(bodyBytes)
+			isAuthError := strings.Contains(bodyStr, "token") ||
+				strings.Contains(bodyStr, "expired") ||
+				strings.Contains(bodyStr, "InvalidAuthenticationToken") ||
+				resp.StatusCode == http.StatusUnauthorized // 401 is always auth
+
+			if isAuthError && retryCount < MaxRetries {
+				fmt.Printf("    [Msg %s] Token expired (%d), refreshing...\n", messageID, resp.StatusCode)
 				newToken, err := refreshAccessToken()
 				if err != nil {
 					return deleteResult{messageID: messageID, err: fmt.Errorf("refresh failed: %w", err)}
@@ -561,7 +571,11 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 				retryCount++
 				continue // Retry with new token
 			}
-			return deleteResult{messageID: messageID, statusCode: resp.StatusCode}
+			// If not auth error, it's a permission/access issue - return error with details
+			if len(bodyStr) > 200 {
+				bodyStr = bodyStr[:200] + "..."
+			}
+			return deleteResult{messageID: messageID, statusCode: resp.StatusCode, err: fmt.Errorf("access denied: %s", bodyStr)}
 		}
 
 		// Handle rate limiting
@@ -585,9 +599,16 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 	}
 }
 
-// startProactiveTokenRefresh starts a background goroutine that refreshes the token every 10 minutes
+// startProactiveTokenRefresh starts a background goroutine that refreshes the token proactively
 func startProactiveTokenRefresh(stopChan <-chan bool) {
 	go func() {
+		// Log startup and initial token status
+		tokenMutex.Lock()
+		initialTimeUntilExpiry := time.Until(tokenExpiry)
+		tokenMutex.Unlock()
+		fmt.Printf("[Background] Proactive token refresh started - checking every %.0f minutes\n", ProactiveRefreshInterval.Minutes())
+		fmt.Printf("[Background] Current token expires in %.0f minutes\n", initialTimeUntilExpiry.Minutes())
+
 		ticker := time.NewTicker(ProactiveRefreshInterval)
 		defer ticker.Stop()
 
@@ -596,18 +617,26 @@ func startProactiveTokenRefresh(stopChan <-chan bool) {
 			case <-ticker.C:
 				// Check if token needs refresh (if expiring within buffer) - read with lock
 				tokenMutex.Lock()
+				timeUntilExpiry := time.Until(tokenExpiry)
 				needsRefresh := time.Now().After(tokenExpiry.Add(-ProactiveRefreshBuffer))
 				tokenMutex.Unlock()
 
 				if !needsRefresh {
+					fmt.Printf("[Background] Token check: %.0f minutes remaining, no refresh needed\n", timeUntilExpiry.Minutes())
 					continue // Token is still good
 				}
-				fmt.Println("[Background] Proactively refreshing token...")
+				fmt.Printf("[Background] Token expires in %.0f minutes, refreshing...\n", timeUntilExpiry.Minutes())
 				_, err := refreshAccessToken()
 				if err != nil {
 					fmt.Printf("[Background] Token refresh failed: %v\n", err)
+				} else {
+					tokenMutex.Lock()
+					newTimeUntilExpiry := time.Until(tokenExpiry)
+					tokenMutex.Unlock()
+					fmt.Printf("[Background] ✓ Token refreshed successfully, %.0f minutes until next expiry\n", newTimeUntilExpiry.Minutes())
 				}
 			case <-stopChan:
+				fmt.Println("[Background] Proactive token refresh stopped")
 				return
 			}
 		}
@@ -681,7 +710,13 @@ func deleteEmails() error {
 
 	fmt.Printf("[API] Response received: %d\n", resp.StatusCode)
 	totalMessages := folderData.TotalItemCount
-	fmt.Printf("Total messages to delete: %d\n\n", totalMessages)
+	fmt.Printf("Total messages to delete: %d\n", totalMessages)
+	if permanentDelete {
+		fmt.Println("⚠️  PERMANENT DELETE MODE - items will be permanently deleted, not moved to trash")
+	} else {
+		fmt.Println("ℹ️  SOFT DELETE MODE - items will be moved to Recoverable Items folder")
+	}
+	fmt.Println()
 
 	if totalMessages == 0 {
 		fmt.Println("No messages to delete!")
