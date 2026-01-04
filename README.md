@@ -44,26 +44,34 @@ go build -o outlook-deleter main.go
 ### Delete emails from a folder
 
 ```bash
+# Soft delete (move to Recoverable Items)
 ./outlook-deleter delete -folder "Deleted Items"
 ./outlook-deleter delete -folder "SOC/Support" -workers 2
+
+# Permanent delete (bypass recovery)
+./outlook-deleter delete -folder "Junk Email" -permanent
 ```
 
 ### Using environment variables
 
 ```bash
 TARGET_FOLDER="Deleted Items" MAX_WORKERS=3 ./outlook-deleter delete
+PERMANENT_DELETE=true ./outlook-deleter delete -folder "Spam"
 ```
 
 ## Configuration
 
 ### Command-line Options
 
-| Flag/Env Var                | Description             | Required         | Default |
-| --------------------------- | ----------------------- | ---------------- | ------- |
-| `-folder` / `TARGET_FOLDER` | Target folder path      | Yes (for delete) | -       |
-| `-workers` / `MAX_WORKERS`  | Parallel workers (1-10) | No               | 5       |
+| Flag/Env Var                      | Description                          | Required         | Default |
+| --------------------------------- | ------------------------------------ | ---------------- | ------- |
+| `-folder` / `TARGET_FOLDER`       | Target folder path                   | Yes (for delete) | -       |
+| `-workers` / `MAX_WORKERS`        | Parallel workers (1-10)              | No               | 5       |
+| `-permanent` / `PERMANENT_DELETE` | Permanently delete (bypass recovery) | No               | false   |
 
 Flags take precedence over environment variables.
+
+**Note**: By default, messages are soft-deleted to the hidden "Recoverable Items" folder (not visible "Deleted Items"). They can be recovered via "Recover items deleted from this folder" in Outlook. Use `-permanent` flag to permanently delete and bypass recovery.
 
 ## Authentication
 
@@ -76,12 +84,14 @@ Flags take precedence over environment variables.
 
 ## Limitations
 
+- **Soft delete by default**: Messages are soft-deleted to **Recoverable Items** (hidden folder) by default, not the visible "Deleted Items" folder. Items can be recovered via "Recover items deleted from this folder" in Outlook. Use the `-permanent` flag to permanently delete and bypass recovery. ([Delete API](https://learn.microsoft.com/en-us/graph/api/message-delete) vs [PermanentDelete API](https://learn.microsoft.com/en-us/graph/api/message-permanentdelete))
 - **No date-based filtering**: Deletes all messages in the target folder (no way to filter by date range)
 - **No sender/subject filtering**: Cannot filter messages by sender, subject, or other criteria
 - **No size-based filtering**: Cannot filter by message size
 - **Folder-level only**: Operates on entire folders, not individual messages or subsets
-- **No dry-run mode**: Deleted messages cannot be recovered (use with caution)
+- **No dry-run mode**: Use with caution - soft deletes move to "Deleted Items", permanent deletes are immediate and irreversible
 - **Rate limiting**: Microsoft Graph API enforces rate limits; tool will retry but large deletions take time
+- **Primary mailbox only**: In-place archive mailboxes (separate archive stores) are not supported - only the primary mailbox is accessible
 
 ## Troubleshooting
 
