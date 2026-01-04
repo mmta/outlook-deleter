@@ -24,19 +24,19 @@ const (
 	DefaultClientID = "51b31bec-d0d8-4939-8b58-e53f56b9e373"
 	DefaultTenantID = "79ba327a-98fe-4f8e-83ac-e9596bac64dc"
 
-	GraphAPI                  = "https://graph.microsoft.com/v1.0"
-	MaxRetries                = 3
-	RetryDelay                = 1 * time.Second
-	TokenBufferDuration       = 5 * time.Minute
-	ProactiveRefreshInterval  = 10 * time.Minute
-	ProactiveRefreshBuffer    = 15 * time.Minute
-	BatchDelayDuration        = 2 * time.Second
-	RetryWaitDuration         = 5 * time.Second
-	MaxFolderDepth            = 50
-	AuthContextTimeout        = 5 * time.Minute
-	HTTPTimeout               = 60 * time.Second
-	HTTPResponseTimeout       = 30 * time.Second
-	DeletionHTTPTimeout       = 30 * time.Second
+	GraphAPI                 = "https://graph.microsoft.com/v1.0"
+	MaxRetries               = 3
+	RetryDelay               = 1 * time.Second
+	TokenBufferDuration      = 5 * time.Minute
+	ProactiveRefreshInterval = 10 * time.Minute
+	ProactiveRefreshBuffer   = 15 * time.Minute
+	BatchDelayDuration       = 2 * time.Second
+	RetryWaitDuration        = 5 * time.Second
+	MaxFolderDepth           = 50
+	AuthContextTimeout       = 5 * time.Minute
+	HTTPTimeout              = 60 * time.Second
+	HTTPResponseTimeout      = 30 * time.Second
+	DeletionHTTPTimeout      = 30 * time.Second
 )
 
 // Runtime configuration (from env vars or defaults)
@@ -140,12 +140,12 @@ type TokenCache struct {
 }
 
 func getTokenCachePath() (string, error) {
-	// Use ~/.cache/outlook-deleter/token.json
-	home, err := os.UserHomeDir()
+	// Use OS-specific cache dir (LOCALAPPDATA on Windows, ~/.cache otherwise)
+	cacheRoot, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
 	}
-	cacheDir := filepath.Join(home, ".cache", "outlook-deleter")
+	cacheDir := filepath.Join(cacheRoot, "outlook-deleter")
 	if err := os.MkdirAll(cacheDir, 0700); err != nil {
 		return "", err
 	}
@@ -518,7 +518,7 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 		tokenMutex.Lock()
 		token := currentToken
 		tokenMutex.Unlock()
-		
+
 		var url string
 		var method string
 		if permanentDelete {
@@ -528,7 +528,7 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 			url = fmt.Sprintf("%s/me/messages/%s", GraphAPI, messageID)
 			method = "DELETE"
 		}
-		
+
 		req, err := http.NewRequest(method, url, nil)
 		if err != nil {
 			return deleteResult{messageID: messageID, err: err}
