@@ -85,6 +85,9 @@ Flags take precedence over environment variables.
 ## Limitations
 
 - **Soft delete by default**: Messages are soft-deleted to **Recoverable Items** (hidden folder) by default, not the visible "Deleted Items" folder. Items can be recovered via "Recover items deleted from this folder" in Outlook. Use the `-permanent` flag to permanently delete and bypass recovery. ([Delete API](https://learn.microsoft.com/en-us/graph/api/message-delete) vs [PermanentDelete API](https://learn.microsoft.com/en-us/graph/api/message-permanentdelete))
+- **Recoverable Items quota limitation**: Both soft and permanent deletes are blocked when Recoverable Items folder (30GB quota for standard mailboxes) is full with error `ErrorQuotaExceededOnDelete`. Soft delete moves items to `/Recoverable Items/Deleted` (user-recoverable), while permanent delete moves items to `/Recoverable Items/Purge` (unrecoverable), but both still consume quota. If you hit this quota limit, you will either have to:
+  - Wait 1-7 days for the Managed Folder Assistant (MFA) to automatically purge items from `/Deleted` based on retention policies, or
+  - Use provided [mailbox-scripts](./mailbox-scripts/) to forcefully drain Recoverable Items.
 - **No date-based filtering**: Deletes all messages in the target folder (no way to filter by date range)
 - **No sender/subject filtering**: Cannot filter messages by sender, subject, or other criteria
 - **No size-based filtering**: Cannot filter by message size
