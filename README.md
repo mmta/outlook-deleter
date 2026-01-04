@@ -121,6 +121,7 @@ Flags take precedence over environment variables.
 - Reduce the number of parallel workers: `-workers 2` or `-workers 1`
 - Run during off-peak hours
 - Break large deletions into smaller batches by folder
+- If you are simultaneously performing heavy Outlook.com actions (e.g., emptying Recoverable Items or other bulk mailbox work), shared mailbox workload throttles can trigger additional 429s unrelated to Graph rate limit. Pause the other activity and retry once the mailbox load subsides.
 
 ### Folder Not Found
 
