@@ -56,6 +56,8 @@ TARGET_FOLDER="Deleted Items" MAX_WORKERS=3 ./outlook-deleter delete
 
 ## Configuration
 
+### Command-line Options
+
 | Flag/Env Var                | Description             | Required         | Default |
 | --------------------------- | ----------------------- | ---------------- | ------- |
 | `-folder` / `TARGET_FOLDER` | Target folder path      | Yes (for delete) | -       |
@@ -71,6 +73,111 @@ Flags take precedence over environment variables.
   - **Linux/macOS**: `~/.cache/outlook-deleter/token.json`
   - **Windows**: `%LOCALAPPDATA%\outlook-deleter\token.json`
   - Tokens are automatically reused on subsequent runs within 1 hour
+
+## Limitations
+
+- **No date-based filtering**: Deletes all messages in the target folder (no way to filter by date range)
+- **No sender/subject filtering**: Cannot filter messages by sender, subject, or other criteria
+- **No size-based filtering**: Cannot filter by message size
+- **Folder-level only**: Operates on entire folders, not individual messages or subsets
+- **No dry-run mode**: Deleted messages cannot be recovered (use with caution)
+- **Rate limiting**: Microsoft Graph API enforces rate limits; tool will retry but large deletions take time
+
+## Troubleshooting
+
+### Permission Denied (403)
+
+**Error**: `"message":"Insufficient privileges to complete the operation."`
+
+**Solution**: Ensure `Mail.ReadWrite` permission is configured in your Azure app registration and admin consent has been granted.
+
+### Token Expired (401)
+
+**Error**: `"code":"InvalidAuthenticationToken","message":"Lifetime validation failed, the token is expired."`
+
+**Solution**: The tool automatically refreshes tokens, but if this persists:
+
+1. Delete the cached token file:
+   - Linux/macOS: `rm ~/.cache/outlook-deleter/token.json`
+   - Windows: `del %LOCALAPPDATA%\outlook-deleter\token.json`
+2. Run the tool again and re-authenticate
+
+### Rate Limiting (429)
+
+**Error**: `status 429, body: {"error":{"code":"ThrottlingNotAllowed",...}}`
+
+**Solution**: Microsoft Graph enforces rate limits. The tool automatically retries with exponential backoff. To speed up:
+
+- Reduce the number of parallel workers: `-workers 2` or `-workers 1`
+- Run during off-peak hours
+- Break large deletions into smaller batches by folder
+
+### Folder Not Found
+
+**Error**: `Error: folder not found`
+
+**Solution**:
+
+1. Run `./outlook-deleter list` to see available folders
+2. Use the exact folder path (case-sensitive)
+3. Use forward slashes for nested folders: `Folder/Subfolder`
+
+## Using a Different Azure Organization
+
+By default, the tool uses _my_ organization credentials. To use a different Azure organization, you need to:
+
+1. **Set up your own Azure App Registration** (see [Azure App Setup](#azure-app-setup-for-custom-organizations) section)
+2. **Get your Client ID and Tenant ID** from your app registration
+3. **Configure the tool** with your credentials:
+
+```bash
+export OUTLOOK_CLIENT_ID=your-client-id
+export OUTLOOK_TENANT_ID=your-tenant-id
+./outlook-deleter list
+```
+
+Or in one command:
+
+```bash
+OUTLOOK_CLIENT_ID=xxx OUTLOOK_TENANT_ID=yyy ./outlook-deleter delete -folder "Inbox"
+```
+
+## Azure App Setup (for Custom Organizations)
+
+If you want to use this tool with your own Azure organization instead of the default:
+
+### 1. Create an Azure App Registration
+
+1. Go to [Azure Portal](https://portal.azure.com)
+2. Navigate to **Azure Active Directory** → **App registrations**
+3. Click **New registration**
+4. Enter a name (e.g., "Outlook Deleter")
+5. Select **Accounts in this organizational directory only**
+6. Click **Register**
+
+### 2. Configure API Permissions
+
+1. In your app registration, go to **API permissions**
+2. Click **Add a permission**
+3. Select **Microsoft Graph**
+4. Choose **Delegated permissions**
+5. Search for and select **Mail.ReadWrite**
+6. Click **Add permissions**
+7. If you have admin rights, click **Grant admin consent for [Your Organization]**
+
+### 3. Get Your Credentials
+
+1. In your app registration, go to **Overview**
+2. Copy the **Application (client) ID**
+3. Copy the **Directory (tenant) ID**
+
+### 4. Use with the Tool
+
+```bash
+export OUTLOOK_CLIENT_ID=<your-client-id>
+export OUTLOOK_TENANT_ID=<your-tenant-id>
+./outlook-deleter list
+```
 
 ## Releasing a New Version
 
