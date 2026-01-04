@@ -19,9 +19,10 @@ import (
 )
 
 // --- Configuration ---
+// Default credentials for hardcoded org; override with env vars for other orgs
 const (
-	ClientID = "51b31bec-d0d8-4939-8b58-e53f56b9e373"
-	TenantID = "79ba327a-98fe-4f8e-83ac-e9596bac64dc"
+	DefaultClientID = "51b31bec-d0d8-4939-8b58-e53f56b9e373"
+	DefaultTenantID = "79ba327a-98fe-4f8e-83ac-e9596bac64dc"
 
 	GraphAPI                  = "https://graph.microsoft.com/v1.0"
 	MaxRetries                = 3
@@ -38,11 +39,26 @@ const (
 	DeletionHTTPTimeout       = 30 * time.Second
 )
 
-// Runtime configuration (from flags or env vars)
+// Runtime configuration (from env vars or defaults)
 var (
+	ClientID     string
+	TenantID     string
 	targetFolder string
 	maxWorkers   int
 )
+
+func init() {
+	// Support env var overrides for other organizations
+	ClientID = getEnvOrDefault("OUTLOOK_CLIENT_ID", DefaultClientID)
+	TenantID = getEnvOrDefault("OUTLOOK_TENANT_ID", DefaultTenantID)
+}
+
+func getEnvOrDefault(envKey, defaultValue string) string {
+	if val := os.Getenv(envKey); val != "" {
+		return val
+	}
+	return defaultValue
+}
 
 // Global token state for automatic refresh
 var (
@@ -911,11 +927,14 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "\nEnvironment Variables:\n")
 	fmt.Fprintf(os.Stderr, "  TARGET_FOLDER           Target folder path (alternative to -folder flag)\n")
 	fmt.Fprintf(os.Stderr, "  MAX_WORKERS             Number of parallel workers (alternative to -workers flag)\n")
+	fmt.Fprintf(os.Stderr, "  OUTLOOK_CLIENT_ID       Azure app client ID (default: built-in org)\n")
+	fmt.Fprintf(os.Stderr, "  OUTLOOK_TENANT_ID       Azure tenant ID (default: built-in org)\n")
 	fmt.Fprintf(os.Stderr, "\nExamples:\n")
 	fmt.Fprintf(os.Stderr, "  %s list\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  %s delete -folder \"Deleted Items\"\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  %s delete -folder \"SOC/Support\" -workers 2\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  TARGET_FOLDER=\"Deleted Items\" %s delete\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  OUTLOOK_CLIENT_ID=xxx OUTLOOK_TENANT_ID=yyy %s list\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "\n")
 }
 
