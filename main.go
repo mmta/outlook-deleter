@@ -34,6 +34,15 @@ var (
 	maxWorkers   int
 )
 
+// Global token state for automatic refresh
+var (
+	currentToken    string
+	tokenMutex      sync.Mutex
+	msalClient      public.Client
+	lastAuthAccount public.Account
+	usedCachedToken bool // Track if we used cache at startup
+)
+
 var (
 	authority = fmt.Sprintf("https://login.microsoftonline.com/%s", TenantID)
 	scopes    = []string{"https://graph.microsoft.com/Mail.ReadWrite"}
@@ -61,10 +70,11 @@ type MessagesResponse struct {
 	NextLink string    `json:"@odata.nextLink"`
 }
 
-// TokenCache represents a cached token with expiry
+// TokenCache represents a cached access token
 type TokenCache struct {
 	AccessToken string    `json:"accessToken"`
 	ExpiresAt   time.Time `json:"expiresAt"`
+	AccountID   string    `json:"accountId"`
 }
 
 func getTokenCachePath() (string, error) {
@@ -104,7 +114,7 @@ func getCachedToken() (string, error) {
 	return "", nil // Token expired
 }
 
-func cacheToken(accessToken string, expiresIn int64) error {
+func cacheToken(accessToken, accountID string, expiresIn int64) error {
 	cachePath, err := getTokenCachePath()
 	if err != nil {
 		return nil // Silently fail
@@ -113,6 +123,7 @@ func cacheToken(accessToken string, expiresIn int64) error {
 	cache := TokenCache{
 		AccessToken: accessToken,
 		ExpiresAt:   time.Now().Add(time.Duration(expiresIn) * time.Second),
+		AccountID:   accountID,
 	}
 
 	data, err := json.Marshal(cache)
@@ -121,6 +132,28 @@ func cacheToken(accessToken string, expiresIn int64) error {
 	}
 
 	return os.WriteFile(cachePath, data, 0600)
+}
+
+func refreshAccessToken() (string, error) {
+	tokenMutex.Lock()
+	defer tokenMutex.Unlock()
+
+	ctx := context.Background()
+
+	// Try silent refresh with the last authenticated account
+	if lastAuthAccount.HomeAccountID != "" {
+		result, err := msalClient.AcquireTokenSilent(ctx, scopes, public.WithSilentAccount(lastAuthAccount))
+		if err == nil {
+			currentToken = result.AccessToken
+			expiresIn := result.ExpiresOn.Unix() - time.Now().Unix()
+			cacheToken(result.AccessToken, result.Account.HomeAccountID, expiresIn)
+			fmt.Println("\n✓ Token automatically refreshed")
+			return result.AccessToken, nil
+		}
+		fmt.Printf("\nWarning: Token refresh failed (%v)\n", err)
+	}
+
+	return "", fmt.Errorf("unable to refresh token")
 }
 
 // isWSL detects if we're running in Windows Subsystem for Linux
@@ -145,30 +178,55 @@ func isWSL() bool {
 }
 
 func getAccessToken() (string, error) {
-	// Try to get from local cache first
-	if token, err := getCachedToken(); err == nil && token != "" {
-		fmt.Println("✓ Using cached token")
-		return token, nil
-	}
-
-	client, err := public.New(ClientID, public.WithAuthority(authority))
+	var err error
+	msalClient, err = public.New(ClientID, public.WithAuthority(authority))
 	if err != nil {
 		return "", fmt.Errorf("failed to create public client: %w", err)
 	}
 
 	ctx := context.Background()
 
+	// Try to get from local cache first
+	cachePath, _ := getTokenCachePath()
+	if cachePath != "" {
+		data, err := os.ReadFile(cachePath)
+		if err == nil {
+			var cache TokenCache
+			if err := json.Unmarshal(data, &cache); err == nil {
+				// Check if access token is still valid (with 5 min buffer)
+				if time.Now().Add(5 * time.Minute).Before(cache.ExpiresAt) {
+					fmt.Println("✓ Using cached access token")
+					usedCachedToken = true
+
+					// Try to load the account for future refreshes
+					accounts, _ := msalClient.Accounts(ctx)
+					for _, acc := range accounts {
+						if acc.HomeAccountID == cache.AccountID {
+							lastAuthAccount = acc
+							break
+						}
+					}
+
+					currentToken = cache.AccessToken
+					return cache.AccessToken, nil
+				}
+			}
+		}
+	}
+
 	// Try to get token from MSAL cache
-	accounts, err := client.Accounts(ctx)
+	accounts, err := msalClient.Accounts(ctx)
 	if err != nil {
 		fmt.Printf("Cache check: no accounts found (%v)\n", err)
 	} else if len(accounts) > 0 {
 		fmt.Printf("Cache check: found account %s\n", accounts[0].PreferredUsername)
-		result, err := client.AcquireTokenSilent(ctx, scopes, public.WithSilentAccount(accounts[0]))
+		result, err := msalClient.AcquireTokenSilent(ctx, scopes, public.WithSilentAccount(accounts[0]))
 		if err == nil {
-			// Cache the token locally
-			cacheToken(result.AccessToken, result.ExpiresOn.Unix()-time.Now().Unix())
+			lastAuthAccount = accounts[0]
+			usedCachedToken = true
+			cacheToken(result.AccessToken, result.Account.HomeAccountID, result.ExpiresOn.Unix()-time.Now().Unix())
 			fmt.Println("✓ Using MSAL cached token")
+			currentToken = result.AccessToken
 			return result.AccessToken, nil
 		}
 		fmt.Printf("Cache check: silent token acquisition failed (%v), will re-authenticate\n", err)
@@ -186,7 +244,7 @@ func getAccessToken() (string, error) {
 		fmt.Println("Please authenticate using the device code flow.")
 		fmt.Println()
 
-		deviceCode, err := client.AcquireTokenByDeviceCode(ctx, scopes)
+		deviceCode, err := msalClient.AcquireTokenByDeviceCode(ctx, scopes)
 		if err != nil {
 			return "", fmt.Errorf("failed to initiate device code flow: %w", err)
 		}
@@ -201,15 +259,17 @@ func getAccessToken() (string, error) {
 		}
 	} else {
 		// Native interactive browser flow for non-WSL environments
-		result, err = client.AcquireTokenInteractive(ctx, scopes)
+		result, err = msalClient.AcquireTokenInteractive(ctx, scopes)
 		if err != nil {
 			return "", fmt.Errorf("interactive authentication failed: %w", err)
 		}
 	}
 
-	// Cache the new token locally
+	// Store the authenticated account for future refreshes
+	lastAuthAccount = result.Account
 	expiresIn := result.ExpiresOn.Unix() - time.Now().Unix()
-	cacheToken(result.AccessToken, expiresIn)
+	cacheToken(result.AccessToken, result.Account.HomeAccountID, expiresIn)
+	currentToken = result.AccessToken
 
 	return result.AccessToken, nil
 }
@@ -337,6 +397,9 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 	delay := RetryDelay
 
 	for retryCount < MaxRetries {
+		tokenMutex.Lock()
+		token := currentToken
+		tokenMutex.Unlock()
 		url := fmt.Sprintf("%s/me/messages/%s", GraphAPI, messageID)
 		req, err := http.NewRequest("DELETE", url, nil)
 		if err != nil {
@@ -352,6 +415,19 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 			return deleteResult{messageID: messageID, err: err}
 		}
 		resp.Body.Close()
+
+		// Handle token expiration
+		if resp.StatusCode == http.StatusUnauthorized {
+			fmt.Printf("    [Msg %s] Token expired, refreshing...\n", messageID)
+			newToken, err := refreshAccessToken()
+			if err != nil {
+				return deleteResult{messageID: messageID, err: fmt.Errorf("refresh failed: %w", err)}
+			}
+			tokenMutex.Lock()
+			currentToken = newToken
+			tokenMutex.Unlock()
+			continue // Retry with new token
+		}
 
 		// Handle rate limiting
 		if resp.StatusCode == http.StatusTooManyRequests {
@@ -402,18 +478,6 @@ func deleteEmails() error {
 	fmt.Println("Successfully authenticated!")
 	fmt.Println()
 
-	// Display folder structure
-	fmt.Println("Getting mailbox folders...")
-	fmt.Println()
-	fmt.Printf("\n%s\n", strings.Repeat("=", 80))
-	fmt.Println("MAILBOX FOLDER STRUCTURE")
-	fmt.Printf("%s\n", strings.Repeat("=", 80))
-
-	if err := displayFoldersRecursive(token, "", ""); err != nil {
-		return fmt.Errorf("failed to display folders: %w", err)
-	}
-	fmt.Printf("%s\n\n", strings.Repeat("=", 80))
-
 	// Find the target folder
 	fmt.Printf("Searching for folder: %s...\n", targetFolder)
 	targetFolderData, folderPath, err := findFolderRecursive(token, targetFolder, "", "")
@@ -453,6 +517,24 @@ func deleteEmails() error {
 	if totalMessages == 0 {
 		fmt.Println("No messages to delete!")
 		return nil
+	}
+
+	// For large deletions (>10k), ensure we have fresh auth with refresh capability
+	if totalMessages > 10000 && usedCachedToken {
+		cachePath, err := getTokenCachePath()
+		if err == nil && cachePath != "" {
+			// Check if cache file exists
+			if _, err := os.Stat(cachePath); err == nil {
+				// Cache exists - delete it and ask user to re-run
+				os.Remove(cachePath)
+				fmt.Println("⚠️  LARGE DELETION DETECTED")
+				fmt.Printf("This folder contains %d messages, which will take several hours.\n", totalMessages)
+				fmt.Println("To ensure uninterrupted operation, please re-run the same command.")
+				fmt.Println("You will be prompted to authenticate fresh, enabling automatic token refresh.")
+				fmt.Println()
+				return nil
+			}
+		}
 	}
 
 	// Delete messages in batches with parallel deletion
