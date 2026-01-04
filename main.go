@@ -23,9 +23,19 @@ const (
 	ClientID = "51b31bec-d0d8-4939-8b58-e53f56b9e373"
 	TenantID = "79ba327a-98fe-4f8e-83ac-e9596bac64dc"
 
-	GraphAPI   = "https://graph.microsoft.com/v1.0"
-	MaxRetries = 3 // Max retries for rate-limited requests
-	RetryDelay = 1 * time.Second
+	GraphAPI                  = "https://graph.microsoft.com/v1.0"
+	MaxRetries                = 3
+	RetryDelay                = 1 * time.Second
+	TokenBufferDuration       = 5 * time.Minute
+	ProactiveRefreshInterval  = 10 * time.Minute
+	ProactiveRefreshBuffer    = 15 * time.Minute
+	BatchDelayDuration        = 2 * time.Second
+	RetryWaitDuration         = 5 * time.Second
+	MaxFolderDepth            = 50
+	AuthContextTimeout        = 5 * time.Minute
+	HTTPTimeout               = 60 * time.Second
+	HTTPResponseTimeout       = 30 * time.Second
+	DeletionHTTPTimeout       = 30 * time.Second
 )
 
 // Runtime configuration (from flags or env vars)
@@ -36,17 +46,52 @@ var (
 
 // Global token state for automatic refresh
 var (
-	currentToken    string
-	tokenMutex      sync.Mutex
-	msalClient      public.Client
-	lastAuthAccount public.Account
-	usedCachedToken bool // Track if we used cache at startup
+	currentToken     string
+	tokenExpiry      time.Time
+	tokenMutex       sync.Mutex
+	msalClient       public.Client
+	lastAuthAccount  public.Account
+	usedCachedToken  bool                          // Track if we used cache at startup
+	isRefreshing     bool                          // Flag to prevent thundering herd
+	refreshCondition = sync.NewCond(&sync.Mutex{}) // Condition variable for refresh coordination
+	msalClientOnce   sync.Once
+)
+
+// Global HTTP clients
+var (
+	httpClient         *http.Client
+	deletionHTTPClient *http.Client
+	httpClientOnce     sync.Once
+	deletionClientOnce sync.Once
 )
 
 var (
 	authority = fmt.Sprintf("https://login.microsoftonline.com/%s", TenantID)
 	scopes    = []string{"https://graph.microsoft.com/Mail.ReadWrite"}
 )
+
+func initHTTPClients() {
+	httpClientOnce.Do(func() {
+		httpClient = &http.Client{
+			Timeout: HTTPTimeout,
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: HTTPResponseTimeout,
+				DisableKeepAlives:     false,
+			},
+		}
+	})
+	deletionClientOnce.Do(func() {
+		deletionHTTPClient = &http.Client{Timeout: DeletionHTTPTimeout}
+	})
+}
+
+func getMSALClient() (public.Client, error) {
+	var err error
+	msalClientOnce.Do(func() {
+		msalClient, err = public.New(ClientID, public.WithAuthority(authority))
+	})
+	return msalClient, err
+}
 
 // API Response structures
 type Folder struct {
@@ -90,34 +135,11 @@ func getTokenCachePath() (string, error) {
 	return filepath.Join(cacheDir, "token.json"), nil
 }
 
-func getCachedToken() (string, error) {
-	cachePath, err := getTokenCachePath()
-	if err != nil {
-		return "", nil // Silently fail, fall back to auth
-	}
-
-	data, err := os.ReadFile(cachePath)
-	if err != nil {
-		return "", nil // File doesn't exist or can't be read
-	}
-
-	var cache TokenCache
-	if err := json.Unmarshal(data, &cache); err != nil {
-		return "", nil // Invalid format, fall back to auth
-	}
-
-	// Check if token is still valid (with 5 min buffer)
-	if time.Now().Add(5 * time.Minute).Before(cache.ExpiresAt) {
-		return cache.AccessToken, nil
-	}
-
-	return "", nil // Token expired
-}
-
 func cacheToken(accessToken, accountID string, expiresIn int64) error {
 	cachePath, err := getTokenCachePath()
 	if err != nil {
-		return nil // Silently fail
+		fmt.Printf("Warning: Unable to get cache path: %v\n", err)
+		return err
 	}
 
 	cache := TokenCache{
@@ -128,32 +150,73 @@ func cacheToken(accessToken, accountID string, expiresIn int64) error {
 
 	data, err := json.Marshal(cache)
 	if err != nil {
-		return nil // Silently fail
+		fmt.Printf("Warning: Failed to marshal token cache: %v\n", err)
+		return err
 	}
 
-	return os.WriteFile(cachePath, data, 0600)
+	if err := os.WriteFile(cachePath, data, 0600); err != nil {
+		fmt.Printf("Warning: Failed to write token cache: %v\n", err)
+		return err
+	}
+	return nil
 }
 
 func refreshAccessToken() (string, error) {
+	// Use condition variable to coordinate multiple refresh attempts
+	refreshCondition.L.Lock()
+	for isRefreshing {
+		// Another goroutine is already refreshing, wait for it to complete
+		refreshCondition.Wait()
+	}
+
+	// Check if token is still valid after waiting (read with lock)
+	if time.Now().Before(tokenExpiry.Add(-TokenBufferDuration)) {
+		refreshCondition.L.Unlock()
+		return currentToken, nil
+	}
+
+	isRefreshing = true
+	refreshCondition.L.Unlock()
+	defer func() {
+		refreshCondition.L.Lock()
+		isRefreshing = false
+		refreshCondition.Broadcast() // Notify waiting goroutines
+		refreshCondition.L.Unlock()
+	}()
+
 	tokenMutex.Lock()
 	defer tokenMutex.Unlock()
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), AuthContextTimeout)
+	defer cancel()
 
 	// Try silent refresh with the last authenticated account
 	if lastAuthAccount.HomeAccountID != "" {
-		result, err := msalClient.AcquireTokenSilent(ctx, scopes, public.WithSilentAccount(lastAuthAccount))
+		client, err := getMSALClient()
+		if err != nil {
+			fmt.Printf("Warning: Failed to get MSAL client: %v\n", err)
+			return "", fmt.Errorf("unable to get MSAL client: %w", err)
+		}
+
+		result, err := client.AcquireTokenSilent(ctx, scopes, public.WithSilentAccount(lastAuthAccount))
 		if err == nil {
-			currentToken = result.AccessToken
-			expiresIn := result.ExpiresOn.Unix() - time.Now().Unix()
-			cacheToken(result.AccessToken, result.Account.HomeAccountID, expiresIn)
-			fmt.Println("\n✓ Token automatically refreshed")
-			return result.AccessToken, nil
+			// Check if token is actually valid (not already expired)
+			if time.Now().Before(result.ExpiresOn.Add(-TokenBufferDuration)) {
+				currentToken = result.AccessToken
+				tokenExpiry = result.ExpiresOn
+				expiresIn := result.ExpiresOn.Unix() - time.Now().Unix()
+				_ = cacheToken(result.AccessToken, result.Account.HomeAccountID, expiresIn)
+				fmt.Println("\n✓ Token automatically refreshed")
+				return result.AccessToken, nil
+			}
+			fmt.Printf("\nWarning: Refreshed token is already expired (expires at %v, now %v)\n", result.ExpiresOn, time.Now())
 		}
 		fmt.Printf("\nWarning: Token refresh failed (%v)\n", err)
 	}
 
-	return "", fmt.Errorf("unable to refresh token")
+	// If silent refresh fails, need to re-authenticate
+	fmt.Println("\nToken refresh failed - re-authentication required")
+	return "", fmt.Errorf("unable to refresh token - silent refresh failed or token already expired")
 }
 
 // isWSL detects if we're running in Windows Subsystem for Linux
@@ -178,36 +241,41 @@ func isWSL() bool {
 }
 
 func getAccessToken() (string, error) {
-	var err error
-	msalClient, err = public.New(ClientID, public.WithAuthority(authority))
+	client, err := getMSALClient()
 	if err != nil {
 		return "", fmt.Errorf("failed to create public client: %w", err)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), AuthContextTimeout)
+	defer cancel()
 
 	// Try to get from local cache first
-	cachePath, _ := getTokenCachePath()
-	if cachePath != "" {
+	cachePath, err := getTokenCachePath()
+	if err == nil && cachePath != "" {
 		data, err := os.ReadFile(cachePath)
 		if err == nil {
 			var cache TokenCache
 			if err := json.Unmarshal(data, &cache); err == nil {
-				// Check if access token is still valid (with 5 min buffer)
-				if time.Now().Add(5 * time.Minute).Before(cache.ExpiresAt) {
+				// Check if access token is still valid (with buffer)
+				if time.Now().Add(TokenBufferDuration).Before(cache.ExpiresAt) {
 					fmt.Println("✓ Using cached access token")
 					usedCachedToken = true
 
 					// Try to load the account for future refreshes
-					accounts, _ := msalClient.Accounts(ctx)
-					for _, acc := range accounts {
-						if acc.HomeAccountID == cache.AccountID {
-							lastAuthAccount = acc
-							break
+					accounts, err := client.Accounts(ctx)
+					if err != nil {
+						fmt.Printf("Warning: Could not load cached account: %v\n", err)
+					} else {
+						for _, acc := range accounts {
+							if acc.HomeAccountID == cache.AccountID {
+								lastAuthAccount = acc
+								break
+							}
 						}
 					}
 
 					currentToken = cache.AccessToken
+					tokenExpiry = cache.ExpiresAt
 					return cache.AccessToken, nil
 				}
 			}
@@ -215,16 +283,17 @@ func getAccessToken() (string, error) {
 	}
 
 	// Try to get token from MSAL cache
-	accounts, err := msalClient.Accounts(ctx)
+	accounts, err := client.Accounts(ctx)
 	if err != nil {
 		fmt.Printf("Cache check: no accounts found (%v)\n", err)
 	} else if len(accounts) > 0 {
 		fmt.Printf("Cache check: found account %s\n", accounts[0].PreferredUsername)
-		result, err := msalClient.AcquireTokenSilent(ctx, scopes, public.WithSilentAccount(accounts[0]))
+		result, err := client.AcquireTokenSilent(ctx, scopes, public.WithSilentAccount(accounts[0]))
 		if err == nil {
 			lastAuthAccount = accounts[0]
 			usedCachedToken = true
-			cacheToken(result.AccessToken, result.Account.HomeAccountID, result.ExpiresOn.Unix()-time.Now().Unix())
+			tokenExpiry = result.ExpiresOn
+			_ = cacheToken(result.AccessToken, result.Account.HomeAccountID, result.ExpiresOn.Unix()-time.Now().Unix())
 			fmt.Println("✓ Using MSAL cached token")
 			currentToken = result.AccessToken
 			return result.AccessToken, nil
@@ -244,7 +313,7 @@ func getAccessToken() (string, error) {
 		fmt.Println("Please authenticate using the device code flow.")
 		fmt.Println()
 
-		deviceCode, err := msalClient.AcquireTokenByDeviceCode(ctx, scopes)
+		deviceCode, err := client.AcquireTokenByDeviceCode(ctx, scopes)
 		if err != nil {
 			return "", fmt.Errorf("failed to initiate device code flow: %w", err)
 		}
@@ -259,7 +328,7 @@ func getAccessToken() (string, error) {
 		}
 	} else {
 		// Native interactive browser flow for non-WSL environments
-		result, err = msalClient.AcquireTokenInteractive(ctx, scopes)
+		result, err = client.AcquireTokenInteractive(ctx, scopes)
 		if err != nil {
 			return "", fmt.Errorf("interactive authentication failed: %w", err)
 		}
@@ -267,8 +336,9 @@ func getAccessToken() (string, error) {
 
 	// Store the authenticated account for future refreshes
 	lastAuthAccount = result.Account
+	tokenExpiry = result.ExpiresOn
 	expiresIn := result.ExpiresOn.Unix() - time.Now().Unix()
-	cacheToken(result.AccessToken, result.Account.HomeAccountID, expiresIn)
+	_ = cacheToken(result.AccessToken, result.Account.HomeAccountID, expiresIn)
 	currentToken = result.AccessToken
 
 	return result.AccessToken, nil
@@ -284,17 +354,16 @@ func makeRequest(method, url, token string) (*http.Response, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Prefer", "outlook.body-content-type=\"text\"")
 
-	client := &http.Client{
-		Timeout: 60 * time.Second,
-		Transport: &http.Transport{
-			ResponseHeaderTimeout: 30 * time.Second,
-			DisableKeepAlives:     false,
-		},
-	}
-	return client.Do(req)
+	initHTTPClients()
+	return httpClient.Do(req)
 }
 
-func displayFoldersRecursive(token, folderID, indent string) error {
+func displayFoldersRecursive(token, folderID, indent string, depth int) error {
+	if depth > MaxFolderDepth {
+		fmt.Printf("%s[Max folder depth reached]\n", indent)
+		return nil
+	}
+
 	url := fmt.Sprintf("%s/me/mailFolders?$top=250", GraphAPI)
 	if folderID != "" {
 		url = fmt.Sprintf("%s/me/mailFolders/%s/childFolders?$top=250", GraphAPI, folderID)
@@ -305,6 +374,20 @@ func displayFoldersRecursive(token, folderID, indent string) error {
 		if err != nil {
 			return err
 		}
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			newToken, refreshErr := refreshAccessToken()
+			if refreshErr != nil {
+				return fmt.Errorf("token expired and refresh failed: %w", refreshErr)
+			}
+			token = newToken
+			resp, err = makeRequest("GET", url, token)
+			if err != nil {
+				return err
+			}
+		}
+
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
@@ -320,7 +403,7 @@ func displayFoldersRecursive(token, folderID, indent string) error {
 			fmt.Printf("%s%-40s | Total: %8d | Unread: %8d\n",
 				indent, folder.DisplayName, folder.TotalItemCount, folder.UnreadItemCount)
 			// Recursively display subfolders
-			if err := displayFoldersRecursive(token, folder.ID, indent+"  "); err != nil {
+			if err := displayFoldersRecursive(token, folder.ID, indent+"  ", depth+1); err != nil {
 				return err
 			}
 		}
@@ -331,7 +414,11 @@ func displayFoldersRecursive(token, folderID, indent string) error {
 	return nil
 }
 
-func findFolderRecursive(token, targetName, folderID, parentPath string) (*Folder, string, error) {
+func findFolderRecursive(token, targetName, folderID, parentPath string, depth int) (*Folder, string, error) {
+	if depth > MaxFolderDepth {
+		return nil, "", fmt.Errorf("max folder depth exceeded while searching for '%s'", targetName)
+	}
+
 	url := fmt.Sprintf("%s/me/mailFolders?$top=250", GraphAPI)
 	if folderID != "" {
 		url = fmt.Sprintf("%s/me/mailFolders/%s/childFolders?$top=250", GraphAPI, folderID)
@@ -342,6 +429,20 @@ func findFolderRecursive(token, targetName, folderID, parentPath string) (*Folde
 		if err != nil {
 			return nil, "", err
 		}
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			newToken, refreshErr := refreshAccessToken()
+			if refreshErr != nil {
+				return nil, "", fmt.Errorf("token expired and refresh failed: %w", refreshErr)
+			}
+			token = newToken
+			resp, err = makeRequest("GET", url, token)
+			if err != nil {
+				return nil, "", err
+			}
+		}
+
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
@@ -370,7 +471,7 @@ func findFolderRecursive(token, targetName, folderID, parentPath string) (*Folde
 			}
 
 			// Recursively search subfolders
-			foundFolder, foundPath, err := findFolderRecursive(token, targetName, folder.ID, currentPath)
+			foundFolder, foundPath, err := findFolderRecursive(token, targetName, folder.ID, currentPath, depth+1)
 			if err != nil {
 				return nil, "", err
 			}
@@ -396,7 +497,7 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 	retryCount := 0
 	delay := RetryDelay
 
-	for retryCount < MaxRetries {
+	for {
 		tokenMutex.Lock()
 		token := currentToken
 		tokenMutex.Unlock()
@@ -409,24 +510,28 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 
-		client := &http.Client{Timeout: 30 * time.Second}
-		resp, err := client.Do(req)
+		initHTTPClients()
+		resp, err := deletionHTTPClient.Do(req)
 		if err != nil {
 			return deleteResult{messageID: messageID, err: err}
 		}
 		resp.Body.Close()
 
-		// Handle token expiration
+		// Handle token expiration (only retry once per request)
 		if resp.StatusCode == http.StatusUnauthorized {
-			fmt.Printf("    [Msg %s] Token expired, refreshing...\n", messageID)
-			newToken, err := refreshAccessToken()
-			if err != nil {
-				return deleteResult{messageID: messageID, err: fmt.Errorf("refresh failed: %w", err)}
+			if retryCount < MaxRetries {
+				fmt.Printf("    [Msg %s] Token expired, refreshing...\n", messageID)
+				newToken, err := refreshAccessToken()
+				if err != nil {
+					return deleteResult{messageID: messageID, err: fmt.Errorf("refresh failed: %w", err)}
+				}
+				tokenMutex.Lock()
+				currentToken = newToken
+				tokenMutex.Unlock()
+				retryCount++
+				continue // Retry with new token
 			}
-			tokenMutex.Lock()
-			currentToken = newToken
-			tokenMutex.Unlock()
-			continue // Retry with new token
+			return deleteResult{messageID: messageID, statusCode: resp.StatusCode}
 		}
 
 		// Handle rate limiting
@@ -448,8 +553,35 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 
 		return deleteResult{messageID: messageID, statusCode: resp.StatusCode, originalStatus: resp.StatusCode}
 	}
+}
 
-	return deleteResult{messageID: messageID, statusCode: -1, err: fmt.Errorf("max retries exceeded")}
+// startProactiveTokenRefresh starts a background goroutine that refreshes the token every 10 minutes
+func startProactiveTokenRefresh(stopChan <-chan bool) {
+	go func() {
+		ticker := time.NewTicker(ProactiveRefreshInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				// Check if token needs refresh (if expiring within buffer) - read with lock
+				tokenMutex.Lock()
+				needsRefresh := time.Now().After(tokenExpiry.Add(-ProactiveRefreshBuffer))
+				tokenMutex.Unlock()
+
+				if !needsRefresh {
+					continue // Token is still good
+				}
+				fmt.Println("[Background] Proactively refreshing token...")
+				_, err := refreshAccessToken()
+				if err != nil {
+					fmt.Printf("[Background] Token refresh failed: %v\n", err)
+				}
+			case <-stopChan:
+				return
+			}
+		}
+	}()
 }
 
 func listFolders() error {
@@ -462,7 +594,7 @@ func listFolders() error {
 	// Display all mail folders recursively
 	fmt.Println("Available Folders:")
 	fmt.Println()
-	if err := displayFoldersRecursive(token, "", ""); err != nil {
+	if err := displayFoldersRecursive(token, "", "", 0); err != nil {
 		return fmt.Errorf("failed to fetch folders: %w", err)
 	}
 
@@ -478,9 +610,16 @@ func deleteEmails() error {
 	fmt.Println("Successfully authenticated!")
 	fmt.Println()
 
+	// Start proactive token refresh in background
+	stopChan := make(chan bool)
+	startProactiveTokenRefresh(stopChan)
+	defer func() {
+		stopChan <- true
+	}()
+
 	// Find the target folder
 	fmt.Printf("Searching for folder: %s...\n", targetFolder)
-	targetFolderData, folderPath, err := findFolderRecursive(token, targetFolder, "", "")
+	targetFolderData, folderPath, err := findFolderRecursive(token, targetFolder, "", "", 0)
 	if err != nil {
 		return fmt.Errorf("error searching for folder: %w", err)
 	}
@@ -578,6 +717,28 @@ func deleteEmails() error {
 		fetchTime := time.Since(fetchStart)
 		fmt.Printf("  [API] Response received in %.2fs, Status: %d\n", fetchTime.Seconds(), resp.StatusCode)
 
+		if resp.StatusCode == http.StatusUnauthorized {
+			fmt.Println("  Token expired, attempting refresh...")
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			fmt.Printf("  Error in batch %d: status %d, body: %s\n", batchNum, resp.StatusCode, string(body))
+
+			// Try to refresh the token
+			newToken, refreshErr := refreshAccessToken()
+			if refreshErr != nil {
+				fmt.Printf("  Token refresh failed: %v\n", refreshErr)
+				fmt.Println("  Unable to continue - token cannot be refreshed")
+				return fmt.Errorf("batch %d failed with 401 and token refresh failed: %w", batchNum, refreshErr)
+			}
+
+			// Update token and retry the entire batch
+			tokenMutex.Lock()
+			token = newToken
+			tokenMutex.Unlock()
+			fmt.Println("  Token refreshed, retrying batch...")
+			continue
+		}
+
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -605,8 +766,8 @@ func deleteEmails() error {
 				fmt.Printf("  Response preview: %s\n", preview)
 			}
 			// For truncated responses, wait and retry
-			fmt.Println("  Possible server issue, waiting 5 seconds before next attempt...")
-			time.Sleep(5 * time.Second)
+			fmt.Println("  Possible server issue, waiting before next attempt...")
+			time.Sleep(RetryWaitDuration)
 			continue
 		}
 
@@ -674,7 +835,7 @@ func deleteEmails() error {
 
 		// Add delay between batches to avoid rate limiting
 		if messagesDeleted < totalMessages {
-			time.Sleep(2 * time.Second)
+			time.Sleep(BatchDelayDuration)
 		}
 	}
 

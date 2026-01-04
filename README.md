@@ -20,7 +20,7 @@ A command-line tool for deleting emails from Microsoft Outlook folders using Mic
 
 ### Pre-built Binaries
 
-Download the latest binaries from [GitHub Releases](https://github.com/YOUR_USERNAME/outlook-deleter/releases):
+Download the latest binaries from [GitHub Releases](https://github.com/mmta/outlook-deleter/releases):
 
 - Windows: `outlook-deleter-windows-amd64.exe`
 - macOS (Apple Silicon): `outlook-deleter-darwin-arm64`
