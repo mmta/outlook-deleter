@@ -41,10 +41,11 @@ const (
 
 // Runtime configuration (from env vars or defaults)
 var (
-	ClientID     string
-	TenantID     string
-	targetFolder string
-	maxWorkers   int
+	ClientID        string
+	TenantID        string
+	targetFolder    string
+	maxWorkers      int
+	permanentDelete bool
 )
 
 func init() {
@@ -82,8 +83,7 @@ var (
 )
 
 var (
-	authority = fmt.Sprintf("https://login.microsoftonline.com/%s", TenantID)
-	scopes    = []string{"https://graph.microsoft.com/Mail.ReadWrite"}
+	scopes = []string{"https://graph.microsoft.com/Mail.ReadWrite"}
 )
 
 func initHTTPClients() {
@@ -104,6 +104,7 @@ func initHTTPClients() {
 func getMSALClient() (public.Client, error) {
 	var err error
 	msalClientOnce.Do(func() {
+		authority := fmt.Sprintf("https://login.microsoftonline.com/%s", TenantID)
 		msalClient, err = public.New(ClientID, public.WithAuthority(authority))
 	})
 	return msalClient, err
@@ -517,14 +518,27 @@ func deleteSingleMessage(messageID, token string) deleteResult {
 		tokenMutex.Lock()
 		token := currentToken
 		tokenMutex.Unlock()
-		url := fmt.Sprintf("%s/me/messages/%s", GraphAPI, messageID)
-		req, err := http.NewRequest("DELETE", url, nil)
+		
+		var url string
+		var method string
+		if permanentDelete {
+			url = fmt.Sprintf("%s/me/messages/%s/permanentDelete", GraphAPI, messageID)
+			method = "POST"
+		} else {
+			url = fmt.Sprintf("%s/me/messages/%s", GraphAPI, messageID)
+			method = "DELETE"
+		}
+		
+		req, err := http.NewRequest(method, url, nil)
 		if err != nil {
 			return deleteResult{messageID: messageID, err: err}
 		}
 
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
+		if permanentDelete {
+			req.Header.Set("Content-Length", "0")
+		}
 
 		initHTTPClients()
 		resp, err := deletionHTTPClient.Do(req)
@@ -879,6 +893,7 @@ func parseFlags() error {
 		deleteCmd := flag.NewFlagSet("delete", flag.ContinueOnError)
 		deleteCmd.StringVar(&targetFolder, "folder", "", "Target folder to delete emails from (required, or use TARGET_FOLDER env var)")
 		deleteCmd.IntVar(&maxWorkers, "workers", 5, "Number of parallel deletion workers (or use MAX_WORKERS env var)")
+		deleteCmd.BoolVar(&permanentDelete, "permanent", false, "Permanently delete messages (bypass Deleted Items folder)")
 
 		if err := deleteCmd.Parse(os.Args[2:]); err != nil {
 			return err
@@ -893,6 +908,12 @@ func parseFlags() error {
 				if w, err := strconv.Atoi(workersEnv); err == nil {
 					maxWorkers = w
 				}
+			}
+		}
+		if !permanentDelete {
+			permEnv := os.Getenv("PERMANENT_DELETE")
+			if permEnv == "true" || permEnv == "1" {
+				permanentDelete = true
 			}
 		}
 
@@ -924,15 +945,18 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "\nDelete options:\n")
 	fmt.Fprintf(os.Stderr, "  -folder <path>          Target folder path (required or set TARGET_FOLDER)\n")
 	fmt.Fprintf(os.Stderr, "  -workers <n>            Number of parallel workers (default: 5)\n")
+	fmt.Fprintf(os.Stderr, "  -permanent              Permanently delete messages (bypass Deleted Items)\n")
 	fmt.Fprintf(os.Stderr, "\nEnvironment Variables:\n")
 	fmt.Fprintf(os.Stderr, "  TARGET_FOLDER           Target folder path (alternative to -folder flag)\n")
 	fmt.Fprintf(os.Stderr, "  MAX_WORKERS             Number of parallel workers (alternative to -workers flag)\n")
+	fmt.Fprintf(os.Stderr, "  PERMANENT_DELETE        Set to 'true' or '1' for permanent deletion\n")
 	fmt.Fprintf(os.Stderr, "  OUTLOOK_CLIENT_ID       Azure app client ID (default: built-in org)\n")
 	fmt.Fprintf(os.Stderr, "  OUTLOOK_TENANT_ID       Azure tenant ID (default: built-in org)\n")
 	fmt.Fprintf(os.Stderr, "\nExamples:\n")
 	fmt.Fprintf(os.Stderr, "  %s list\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  %s delete -folder \"Deleted Items\"\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  %s delete -folder \"SOC/Support\" -workers 2\n", os.Args[0])
+	fmt.Fprintf(os.Stderr, "  %s delete -folder \"Junk Email\" -permanent\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  TARGET_FOLDER=\"Deleted Items\" %s delete\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "  OUTLOOK_CLIENT_ID=xxx OUTLOOK_TENANT_ID=yyy %s list\n", os.Args[0])
 	fmt.Fprintf(os.Stderr, "\n")
